@@ -50,30 +50,61 @@
         </label>
       </div>
 
-      <h3>AI 설정</h3>
-      <div class="form-grid">
-        <label class="field">
-          <span>제공자</span>
-          <select id="provider">
-            <option value="claude">Claude (Anthropic)</option>
-            <option value="openai">OpenAI</option>
-          </select>
-        </label>
-        <label class="field">
-          <span>모델 이름</span>
-          <input type="text" id="model" value="claude-opus-5-5" spellcheck="false" autocomplete="off">
-        </label>
-        <label class="field wide">
-          <span>API 키</span>
-          <input type="password" id="api-key" placeholder="sk-..." autocomplete="off" spellcheck="false">
-          <small class="hint">API 키는 이 페이지의 메모리에만 있고 어디에도 저장되지 않습니다. 새로고침하면 사라집니다.</small>
-        </label>
+      <h3>AI 사용 방법</h3>
+      <div class="mode-tabs" role="radiogroup">
+        <label class="mode-tab"><input type="radio" name="mode" value="api" checked> <b>API로 생성</b><small>API 키 필요 · 버튼 한 번으로 끝</small></label>
+        <label class="mode-tab"><input type="radio" name="mode" value="manual"> <b>직접 붙여넣기</b><small>키 없이 무료 · ChatGPT 등 웹 채팅 이용</small></label>
       </div>
 
-      <div class="actions">
-        <button type="button" class="primary" id="generate-btn">대본 생성하기</button>
-        <span class="status" id="generate-status" aria-live="polite"></span>
+      <!-- API 모드 -->
+      <div id="api-mode">
+        <div class="form-grid">
+          <label class="field">
+            <span>제공자</span>
+            <select id="provider">
+              <option value="claude">Claude (Anthropic)</option>
+              <option value="openai">OpenAI</option>
+              <option value="gemini">Gemini (Google · 무료 등급 있음)</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>모델 이름</span>
+            <input type="text" id="model" value="claude-opus-5-5" spellcheck="false" autocomplete="off">
+          </label>
+          <label class="field wide">
+            <span>API 키</span>
+            <input type="password" id="api-key" placeholder="sk-ant-..." autocomplete="off" spellcheck="false">
+            <small class="hint" id="key-hint">API 키는 이 페이지의 메모리에만 있고 어디에도 저장되지 않습니다. 새로고침하면 사라집니다.</small>
+          </label>
+        </div>
+        <div class="actions">
+          <button type="button" class="primary" id="generate-btn">대본 생성하기</button>
+        </div>
       </div>
+
+      <!-- 직접 붙여넣기 모드 -->
+      <div id="manual-mode" class="hidden">
+        <ol class="manual-steps">
+          <li>
+            <b>프롬프트 복사</b> — 위의 슬라이드와 설정으로 AI에게 보낼 프롬프트를 만듭니다.
+            <div class="actions"><button type="button" id="copy-prompt-btn">프롬프트 복사</button></div>
+          </li>
+          <li>
+            <b>웹 채팅에 붙여넣기</b> —
+            <a href="https://chatgpt.com" target="_blank" rel="noopener">ChatGPT</a>,
+            <a href="https://claude.ai" target="_blank" rel="noopener">Claude</a>,
+            <a href="https://gemini.google.com" target="_blank" rel="noopener">Gemini</a>
+            중 하나를 열어 붙여 넣고 보냅니다.
+          </li>
+          <li>
+            <b>AI의 답변 붙여넣기</b> — AI가 준 JSON 답변 전체를 복사해서 아래에 붙여 넣습니다.
+            <textarea id="pasted-response" rows="6" placeholder='{"slides": [...], "questions": [...]}' spellcheck="false"></textarea>
+            <div class="actions"><button type="button" class="primary" id="manual-btn">결과 만들기</button></div>
+          </li>
+        </ol>
+      </div>
+
+      <p class="status" id="generate-status" aria-live="polite"></p>
 
       <!-- JSON 파싱 실패 / API 오류 표시 -->
       <div class="error-box hidden" id="error-box">

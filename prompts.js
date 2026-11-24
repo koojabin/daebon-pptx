@@ -32,6 +32,14 @@ function buildSystemPrompt() {
 }
 
 /**
+ * 직접 붙여넣기 모드용: 웹 채팅(ChatGPT, claude.ai 등)에는 시스템 프롬프트 칸이 없으므로
+ * 시스템 프롬프트와 사용자 프롬프트를 한 덩어리로 합친다.
+ */
+function buildChatPrompt(params) {
+  return `${buildSystemPrompt()}\n\n아래 내용으로 작업해 주세요. 답변은 JSON만 보내 주세요.\n\n${buildUserPrompt(params)}`;
+}
+
+/**
  * 사용자 프롬프트: 발표 정보 + 작성 규칙 + 출력 형식 + 슬라이드 내용
  * @param {object} p
  * @param {Array<{index:number,text:string,notes:string,memo:string}>} p.slides

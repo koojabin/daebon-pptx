@@ -9,6 +9,7 @@ const state = {
   fileName: '',
   slides: [],   // [{ index, text, notes, memo }]
   results: [],  // 생성 결과 기록 (설정을 바꿔 다시 생성하면 계속 쌓인다)
+  manualRequest: null, // 직접 붙여넣기 모드: 프롬프트를 복사한 시점의 { settings, slides, fileName }
   busy: false,
 };
 // 주의: API 키는 state에 넣지 않는다. 호출할 때마다 입력칸에서 읽어 쓰고 버린다.
@@ -36,6 +37,11 @@ const el = {
   retryBtn: $('retry-btn'),
   resultSection: $('result-section'),
   resultGrid: $('result-grid'),
+  apiMode: $('api-mode'),
+  manualMode: $('manual-mode'),
+  copyPromptBtn: $('copy-prompt-btn'),
+  pastedResponse: $('pasted-response'),
+  manualBtn: $('manual-btn'),
   compareWrap: $('compare-wrap'),
   compareSelect: $('compare-select'),
 };
@@ -203,6 +209,8 @@ async function handleFile(file) {
     state.fileName = file.name;
     // 다른 PPT의 결과와 섞이지 않도록 이전 결과를 비운다
     state.results = [];
+    state.manualRequest = null;
+    el.pastedResponse.value = '';
     el.resultSection.classList.add('hidden');
     el.resultGrid.replaceChildren();
     hideError();
@@ -263,6 +271,7 @@ el.dropzone.addEventListener('drop', (e) => handleFile(e.dataTransfer.files[0]))
 const DEFAULT_MODELS = {
   claude: 'claude-opus-5-5',
   openai: 'gpt-4o',
+  gemini: 'gemini-3.8-flash', // 2026-11 기준 무료 등급이 있는 Flash 모델
 };
 
 // 서버 측 자동 대체(fallbacks)를 지원하는 Claude 모델.
@@ -291,6 +300,7 @@ async function readErrorMessage(res) {
 
 function httpErrorText(status, message) {
   const tips = {
+    400: 'API 키와 모델 이름이 올바른지 확인해 주세요.',
     401: 'API 키가 올바른지 확인해 주세요.',
     403: '이 키로 해당 모델을 쓸 권한이 없습니다.',
     404: '모델 이름이 올바른지 확인해 주세요.',
@@ -361,8 +371,37 @@ async function callOpenAI({ model, apiKey, system, user }) {
   return { text: choice?.message?.content || '', truncated: choice?.finish_reason === 'length' };
 }
 
+// Google Gemini generateContent API 호출 (Google AI Studio에서 무료 키 발급 가능)
+async function callGemini({ model, apiKey, system, user }) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  const res = await fetchOrNetworkError(url, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      // 키를 URL(?key=)에 넣으면 기록에 남을 수 있어 헤더로 보낸다
+      'x-goog-api-key': apiKey,
+    },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: system }] },
+      contents: [{ role: 'user', parts: [{ text: user }] }],
+      generationConfig: { responseMimeType: 'application/json', maxOutputTokens: 16000 },
+    }),
+  });
+  if (!res.ok) throw new Error(httpErrorText(res.status, await readErrorMessage(res)));
+
+  const data = await res.json();
+  if (data.promptFeedback?.blockReason) {
+    throw new Error(`AI가 이 요청을 차단했습니다 (${data.promptFeedback.blockReason}). 슬라이드 내용이나 설정을 바꿔 다시 시도해 주세요.`);
+  }
+  const candidate = data.candidates?.[0];
+  const text = (candidate?.content?.parts || []).map((p) => p.text || '').join('');
+  return { text, truncated: candidate?.finishReason === 'MAX_TOKENS' };
+}
+
 function callAI(provider, args) {
-  return provider === 'openai' ? callOpenAI(args) : callClaude(args);
+  if (provider === 'openai') return callOpenAI(args);
+  if (provider === 'gemini') return callGemini(args);
+  return callClaude(args);
 }
 
 // AI 응답 문자열 → { slides, questions }. 형식이 틀리면 예외를 던진다.
@@ -505,11 +544,7 @@ async function generate() {
       return;
     }
 
-    const result = buildResult(parsed, settings, slides.length, fileName);
-    state.results.push(result);
-    renderResults();
-    setStatus(el.generateStatus, `완료! 결과 #${result.id}가 아래에 추가되었습니다.`);
-    el.resultSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    addResult(parsed, settings, slides.length, fileName);
   } catch (e) {
     console.error(e);
     // 네트워크 오류 문구는 fetchOrNetworkError에서 붙여 준다
@@ -520,11 +555,81 @@ async function generate() {
   }
 }
 
+function addResult(parsed, settings, slideCount, fileName) {
+  const result = buildResult(parsed, settings, slideCount, fileName);
+  state.results.push(result);
+  renderResults();
+  setStatus(el.generateStatus, `완료! 결과 #${result.id}가 아래에 추가되었습니다.`);
+  el.resultSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+// ----- 직접 붙여넣기 모드 (API 키 없이 웹 채팅 이용) -----
+// 프롬프트를 복사한 시점의 슬라이드·설정을 기억해 두고, 붙여넣은 답을 그 기준으로 정리한다
+async function copyPrompt() {
+  const settings = readSettings();
+  const problems = [];
+  if (!state.slides.length) problems.push('먼저 PPT 파일을 올려 주세요.');
+  if (!(settings.minutes >= 1 && settings.minutes <= 120)) problems.push('발표 시간은 1~120분 사이로 입력해 주세요.');
+  if (problems.length) {
+    setStatus(el.generateStatus, problems.join(' '), true);
+    return;
+  }
+  settings.provider = 'manual';
+  settings.model = '직접 붙여넣기';
+  state.manualRequest = { settings, slides: state.slides, fileName: state.fileName };
+  const prompt = buildChatPrompt({ slides: state.slides, ...settings });
+  const ok = await copyText(prompt);
+  if (ok) {
+    flashButton(el.copyPromptBtn, '복사됨!');
+    setStatus(el.generateStatus, `프롬프트를 복사했습니다 (${prompt.length.toLocaleString()}자). 웹 채팅에 붙여 넣고, 받은 답을 3번 칸에 넣어 주세요.`);
+  } else {
+    setStatus(el.generateStatus, '클립보드 복사에 실패했습니다. 브라우저 권한을 확인해 주세요.', true);
+  }
+}
+
+function generateManual() {
+  const raw = el.pastedResponse.value.trim();
+  if (!state.manualRequest) {
+    setStatus(el.generateStatus, '먼저 1번 "프롬프트 복사"를 눌러 주세요.', true);
+    return;
+  }
+  if (!raw) {
+    setStatus(el.generateStatus, 'AI의 답변을 3번 칸에 붙여 넣어 주세요.', true);
+    return;
+  }
+  hideError();
+  const { settings, slides, fileName } = state.manualRequest;
+  let parsed;
+  try {
+    parsed = parseAIJson(raw);
+  } catch (e) {
+    showError(`붙여 넣은 답변을 JSON으로 읽지 못했습니다. (${e.message})\n→ AI의 답변이 중간에 끊겼다면 "계속"이라고 보내서 나머지를 받은 뒤 전체를 붙여 넣어 주세요.`, raw);
+    setStatus(el.generateStatus, '');
+    return;
+  }
+  addResult(parsed, { ...settings }, slides.length, fileName);
+}
+
+function currentMode() {
+  return document.querySelector('input[name="mode"]:checked').value;
+}
+
 el.generateBtn.addEventListener('click', generate);
-el.retryBtn.addEventListener('click', generate);
+el.retryBtn.addEventListener('click', () => (currentMode() === 'manual' ? generateManual() : generate()));
+el.copyPromptBtn.addEventListener('click', copyPrompt);
+el.manualBtn.addEventListener('click', generateManual);
+document.querySelectorAll('input[name="mode"]').forEach((radio) => radio.addEventListener('change', () => {
+  const manual = currentMode() === 'manual';
+  el.apiMode.classList.toggle('hidden', manual);
+  el.manualMode.classList.toggle('hidden', !manual);
+  hideError();
+  setStatus(el.generateStatus, '');
+}));
+
+const KEY_PLACEHOLDERS = { claude: 'sk-ant-...', openai: 'sk-...', gemini: 'AIza...' };
 el.provider.addEventListener('change', () => {
   el.model.value = DEFAULT_MODELS[el.provider.value];
-  el.apiKey.placeholder = el.provider.value === 'openai' ? 'sk-...' : 'sk-ant-...';
+  el.apiKey.placeholder = KEY_PLACEHOLDERS[el.provider.value];
 });
 
 // ======================================================================
@@ -639,10 +744,11 @@ function resultToText(result) {
   return lines.join('\n');
 }
 
-async function copyResult(result, button) {
-  const text = resultToText(result);
+// 클립보드에 복사하고 성공 여부를 돌려준다
+async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
+    return true;
   } catch {
     // file:// 등 clipboard API를 못 쓰는 환경을 위한 대체 방법
     const ta = h('textarea', {});
@@ -651,12 +757,13 @@ async function copyResult(result, button) {
     ta.select();
     const ok = document.execCommand('copy');
     ta.remove();
-    if (!ok) {
-      flashButton(button, '복사 실패 — .txt 다운로드를 이용해 주세요');
-      return;
-    }
+    return ok;
   }
-  flashButton(button, '복사됨!');
+}
+
+async function copyResult(result, button) {
+  const ok = await copyText(resultToText(result));
+  flashButton(button, ok ? '복사됨!' : '복사 실패 — .txt 다운로드를 이용해 주세요');
 }
 
 function flashButton(button, message) {

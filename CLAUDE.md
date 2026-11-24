@@ -28,7 +28,8 @@ PPT 파일을 올리면 생성형 AI가 슬라이드별 발표 대본과 교수�
 5. 설정을 바꿔 다시 생성하면 이전 결과와 나란히 비교할 수 있으면 좋다 (발표 시연용, 여유가 있을 때).
 
 ## AI 호출
-- 사용자가 화면에서 제공자(Claude / OpenAI)를 고르고, API 키와 모델 이름을 입력한다.
+- 사용자가 화면에서 제공자(Claude / OpenAI / Gemini)를 고르고, API 키와 모델 이름을 입력한다.
+- API 키가 없으면 "직접 붙여넣기" 모드: 프롬프트를 복사해 웹 채팅(ChatGPT 등)에 붙여 넣고, 받은 JSON 답을 앱에 다시 붙여 넣는다.
 - API 키는 메모리(변수)에만 두고 localStorage, 쿠키, 코드, 커밋 어디에도 저장하지 않는다.
 - Claude API를 브라우저에서 직접 호출할 때는 `anthropic-dangerous-direct-browser-access: true` 헤더가 필요하다.
 - AI에게는 JSON으로만 답하도록 요청하고, 형식은 다음과 같다:
