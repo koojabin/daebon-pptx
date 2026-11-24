@@ -8,7 +8,10 @@
 const state = {
   fileName: '',
   slides: [],   // [{ index, text, notes, memo }]
+  results: [],  // 생성 결과 기록 (설정을 바꿔 다시 생성하면 계속 쌓인다)
+  busy: false,
 };
+// 주의: API 키는 state에 넣지 않는다. 호출할 때마다 입력칸에서 읽어 쓰고 버린다.
 
 // ===== DOM =====
 const $ = (id) => document.getElementById(id);
@@ -19,6 +22,20 @@ const el = {
   previewSection: $('preview-section'),
   slideList: $('slide-list'),
   settingsSection: $('settings-section'),
+  minutes: $('minutes'),
+  professorStyle: $('professor-style'),
+  provider: $('provider'),
+  model: $('model'),
+  apiKey: $('api-key'),
+  generateBtn: $('generate-btn'),
+  generateStatus: $('generate-status'),
+  errorBox: $('error-box'),
+  errorMessage: $('error-message'),
+  rawDetails: $('raw-details'),
+  rawOutput: $('raw-output'),
+  retryBtn: $('retry-btn'),
+  resultSection: $('result-section'),
+  resultGrid: $('result-grid'),
 };
 
 // 작은 DOM 생성 도우미 (텍스트는 항상 textContent로 넣어 HTML 주입을 막는다)
@@ -208,3 +225,323 @@ el.fileInput.addEventListener('change', (e) => handleFile(e.target.files[0]));
   el.dropzone.classList.remove('dragover');
 }));
 el.dropzone.addEventListener('drop', (e) => handleFile(e.dataTransfer.files[0]));
+
+// ======================================================================
+// 3. AI 호출 (Claude / OpenAI)
+// ======================================================================
+const DEFAULT_MODELS = {
+  claude: 'claude-opus-5-5',
+  openai: 'gpt-4o',
+};
+
+// 서버 측 자동 대체(fallbacks)를 지원하는 Claude 모델.
+// 안전 분류기가 요청을 거절(refusal)하면 서버가 다른 모델로 다시 시도해 준다.
+const CLAUDE_FALLBACK_MODELS = new Set([
+  'claude-opus-5-5', 'claude-opus-5', 'claude-fable-5-2', 'claude-fable-5-1', 'claude-sonnet-5-5',
+]);
+
+async function readErrorMessage(res) {
+  try {
+    const data = await res.json();
+    return data?.error?.message || JSON.stringify(data);
+  } catch {
+    return res.statusText;
+  }
+}
+
+function httpErrorText(status, message) {
+  const tips = {
+    401: 'API 키가 올바른지 확인해 주세요.',
+    403: '이 키로 해당 모델을 쓸 권한이 없습니다.',
+    404: '모델 이름이 올바른지 확인해 주세요.',
+    429: '요청이 너무 많거나 크레딧이 부족합니다. 잠시 후 다시 시도해 주세요.',
+  };
+  return `API 오류 (${status}): ${message}${tips[status] ? `\n→ ${tips[status]}` : ''}`;
+}
+
+// Claude Messages API를 브라우저에서 직접 호출
+async function callClaude({ model, apiKey, system, user }) {
+  const headers = {
+    'content-type': 'application/json',
+    'x-api-key': apiKey,
+    'anthropic-version': '2026-10-21',
+    // 브라우저에서 직접 호출할 때 필요한 헤더 (키가 브라우저에 노출됨을 알고 쓴다는 표시)
+    'anthropic-dangerous-direct-browser-access': 'true',
+  };
+  const body = {
+    model,
+    max_tokens: 16000,
+    system,
+    messages: [{ role: 'user', content: user }],
+  };
+  if (CLAUDE_FALLBACK_MODELS.has(model)) {
+    headers['anthropic-beta'] = 'server-side-fallback-2026-07-01';
+    body.fallbacks = 'default';
+  }
+
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST', headers, body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(httpErrorText(res.status, await readErrorMessage(res)));
+
+  const data = await res.json();
+  if (data.stop_reason === 'refusal') {
+    throw new Error('AI가 이 요청에 대한 응답을 거절했습니다. 슬라이드 내용이나 설정을 바꿔 다시 시도해 주세요.');
+  }
+  // 응답에는 thinking 블록 등이 섞일 수 있으므로 text 블록만 모은다
+  const text = (data.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('');
+  return { text, truncated: data.stop_reason === 'max_tokens' };
+}
+
+// OpenAI Chat Completions API 호출
+async function callOpenAI({ model, apiKey, system, user }) {
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+      response_format: { type: 'json_object' },
+      max_completion_tokens: 16000,
+    }),
+  });
+  if (!res.ok) throw new Error(httpErrorText(res.status, await readErrorMessage(res)));
+
+  const data = await res.json();
+  const choice = data.choices?.[0];
+  return { text: choice?.message?.content || '', truncated: choice?.finish_reason === 'length' };
+}
+
+function callAI(provider, args) {
+  return provider === 'openai' ? callOpenAI(args) : callClaude(args);
+}
+
+// AI 응답 문자열 → { slides, questions }. 형식이 틀리면 예외를 던진다.
+function parseAIJson(raw) {
+  let text = raw.trim();
+  // 코드블록(```json ... ```)으로 감싸서 오는 경우 벗겨 낸다
+  text = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start === -1 || end <= start) throw new Error('응답에서 JSON을 찾지 못했습니다.');
+
+  const data = JSON.parse(text.slice(start, end + 1));
+  if (!Array.isArray(data.slides)) throw new Error('JSON에 "slides" 배열이 없습니다.');
+
+  const slides = data.slides
+    .map((s) => ({
+      index: Number(s.index),
+      script: String(s.script ?? '').trim(),
+      seconds: Math.max(0, Math.round(Number(s.seconds) || 0)),
+    }))
+    .filter((s) => Number.isFinite(s.index));
+  const questions = (Array.isArray(data.questions) ? data.questions : [])
+    .map((q) => ({ question: String(q.question ?? '').trim(), answerHint: String(q.answerHint ?? '').trim() }))
+    .filter((q) => q.question);
+  return { slides, questions };
+}
+
+// ======================================================================
+// 4. 시간 계산
+// ======================================================================
+// 한국어 발화 속도(분당 약 280자, 공백 제외)로 계산한 예상 시간(초)
+function estimateSeconds(script) {
+  const chars = script.replace(/\s/g, '').length;
+  return Math.round((chars / SPEECH_CHARS_PER_MINUTE) * 60);
+}
+
+function formatTime(totalSeconds) {
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds % 60;
+  return m ? `${m}분 ${s}초` : `${s}초`;
+}
+
+// AI 응답을 슬라이드 순서에 맞춰 정리하고 시간을 계산해 결과 객체를 만든다
+function buildResult(parsed, settings, slideCount) {
+  const byIndex = new Map(parsed.slides.map((s) => [s.index, s]));
+  const slides = [];
+  for (let i = 1; i <= slideCount; i++) {
+    const s = byIndex.get(i);
+    slides.push(s
+      ? { index: i, script: s.script, aiSeconds: s.seconds, calcSeconds: estimateSeconds(s.script) }
+      : { index: i, script: '', aiSeconds: 0, calcSeconds: 0, missing: true });
+  }
+  return {
+    id: state.results.length + 1,
+    createdAt: new Date(),
+    settings,
+    slides,
+    questions: parsed.questions,
+    targetSeconds: Math.round(settings.minutes * 60),
+    aiTotal: slides.reduce((sum, s) => sum + s.aiSeconds, 0),
+    calcTotal: slides.reduce((sum, s) => sum + s.calcSeconds, 0),
+  };
+}
+
+// ======================================================================
+// 5. 생성 흐름
+// ======================================================================
+function readSettings() {
+  return {
+    minutes: Number(el.minutes.value),
+    professorStyle: el.professorStyle.value,
+    tone: document.querySelector('input[name="tone"]:checked').value,
+    provider: el.provider.value,
+    model: el.model.value.trim(),
+  };
+}
+
+function showError(message, raw) {
+  el.errorMessage.textContent = message;
+  el.rawDetails.classList.toggle('hidden', !raw);
+  el.rawOutput.textContent = raw || '';
+  el.errorBox.classList.remove('hidden');
+}
+
+function hideError() {
+  el.errorBox.classList.add('hidden');
+}
+
+function setBusy(busy) {
+  state.busy = busy;
+  el.generateBtn.disabled = busy;
+  el.retryBtn.disabled = busy;
+  el.generateBtn.textContent = busy ? '생성 중...' : '대본 생성하기';
+}
+
+async function generate() {
+  if (state.busy) return;
+  const settings = readSettings();
+  const apiKey = el.apiKey.value.trim();
+
+  // 입력 확인
+  const problems = [];
+  if (!state.slides.length) problems.push('먼저 PPT 파일을 올려 주세요.');
+  if (!(settings.minutes > 0)) problems.push('발표 시간을 1분 이상으로 입력해 주세요.');
+  if (!settings.model) problems.push('모델 이름을 입력해 주세요.');
+  if (!apiKey) problems.push('API 키를 입력해 주세요.');
+  if (problems.length) {
+    setStatus(el.generateStatus, problems.join(' '), true);
+    return;
+  }
+
+  hideError();
+  setBusy(true);
+  setStatus(el.generateStatus, `${settings.model}에게 대본을 요청하는 중... (슬라이드 수에 따라 1~2분 걸릴 수 있어요)`);
+
+  let raw = '';
+  try {
+    const reply = await callAI(settings.provider, {
+      model: settings.model,
+      apiKey,
+      system: buildSystemPrompt(),
+      user: buildUserPrompt({ slides: state.slides, ...settings }),
+    });
+    raw = reply.text;
+
+    let parsed;
+    try {
+      parsed = parseAIJson(raw);
+    } catch (e) {
+      const why = reply.truncated
+        ? '응답이 길이 제한에 걸려 중간에 잘렸습니다. 슬라이드 수를 줄이거나 발표 시간을 줄여 다시 시도해 주세요.'
+        : `AI 응답을 JSON으로 읽지 못했습니다. (${e.message})`;
+      showError(why, raw);
+      setStatus(el.generateStatus, '');
+      return;
+    }
+
+    const result = buildResult(parsed, settings, state.slides.length);
+    state.results.push(result);
+    renderResults();
+    setStatus(el.generateStatus, `완료! 결과 #${result.id}가 아래에 추가되었습니다.`);
+    el.resultSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } catch (e) {
+    console.error(e);
+    // fetch 자체가 실패하면(네트워크/CORS) TypeError가 난다
+    const message = e instanceof TypeError
+      ? `네트워크 오류: API 서버에 연결하지 못했습니다. 인터넷 연결을 확인해 주세요. (${e.message})`
+      : e.message;
+    showError(message, raw);
+    setStatus(el.generateStatus, '');
+  } finally {
+    setBusy(false);
+  }
+}
+
+el.generateBtn.addEventListener('click', generate);
+el.retryBtn.addEventListener('click', generate);
+el.provider.addEventListener('change', () => {
+  el.model.value = DEFAULT_MODELS[el.provider.value];
+  el.apiKey.placeholder = el.provider.value === 'openai' ? 'sk-...' : 'sk-ant-...';
+});
+
+// ======================================================================
+// 6. 결과 화면
+// ======================================================================
+function timeSummary(result) {
+  const { targetSeconds, aiTotal, calcTotal } = result;
+  const worst = Math.max(aiTotal, calcTotal);
+  let level = 'ok';
+  let verdict = '목표 시간에 잘 맞습니다.';
+  if (worst > targetSeconds) {
+    level = 'over';
+    verdict = `⚠ 목표 시간보다 최대 ${formatTime(worst - targetSeconds)} 깁니다. 대본을 줄이거나 발표 시간을 늘려 다시 생성해 보세요.`;
+  } else if (worst < targetSeconds * 0.8) {
+    level = 'under';
+    verdict = `목표 시간보다 ${formatTime(targetSeconds - worst)} 이상 짧습니다. 내용을 보충해도 좋아요.`;
+  }
+  return h('div', { class: `time-summary ${level}` },
+    h('div', { class: 'rows' },
+      h('span', {}, '목표 시간'), h('b', {}, formatTime(targetSeconds)),
+      h('span', {}, 'AI 예상 합계'), h('span', {}, formatTime(aiTotal)),
+      h('span', {}, '글자 수 기준'), h('span', {}, `${formatTime(calcTotal)} (분당 ${SPEECH_CHARS_PER_MINUTE}자)`)),
+    h('div', { class: 'verdict' }, verdict));
+}
+
+function renderResultColumn(result, { previous = false } = {}) {
+  const s = result.settings;
+  const time = result.createdAt.toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
+
+  const scripts = result.slides.map((sl) => h('div', { class: `script-item${sl.missing ? ' missing' : ''}` },
+    h('header', {},
+      `슬라이드 ${sl.index}`,
+      sl.missing ? null : h('span', { class: 'secs' }, `AI ${sl.aiSeconds}초 · 글자 수 기준 ${sl.calcSeconds}초`)),
+    h('p', {}, sl.missing ? 'AI가 이 슬라이드의 대본을 만들지 않았습니다. 다시 생성해 보세요.' : sl.script)));
+
+  const questions = result.questions.length
+    ? h('ol', { class: 'questions' }, result.questions.map((q) => h('li', {},
+      h('div', { class: 'q' }, q.question),
+      q.answerHint ? h('div', { class: 'a' }, q.answerHint) : null)))
+    : h('p', { class: 'hint' }, '예상 질문이 생성되지 않았습니다.');
+
+  return h('article', { class: `result-col${previous ? ' previous' : ''}` },
+    h('div', { class: 'result-head' },
+      h('div', {},
+        h('h3', {}, `결과 #${result.id}${previous ? ' (비교 대상)' : ''}`),
+        h('div', { class: 'chips' },
+          h('span', { class: 'chip' }, time),
+          h('span', { class: 'chip' }, `${s.minutes}분`),
+          h('span', { class: 'chip' }, s.tone),
+          h('span', { class: 'chip' }, s.model),
+          s.professorStyle.trim() ? h('span', { class: 'chip' }, `교수님: ${s.professorStyle.trim()}`) : null)),
+      h('div', { class: 'result-actions' })),
+    timeSummary(result),
+    h('h4', {}, '발표 대본'),
+    scripts,
+    h('h4', {}, '예상 질문'),
+    questions);
+}
+
+function renderResults() {
+  const latest = state.results[state.results.length - 1];
+  if (!latest) return;
+  el.resultSection.classList.remove('hidden');
+  el.resultGrid.replaceChildren(renderResultColumn(latest));
+}
