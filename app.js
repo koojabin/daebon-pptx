@@ -116,18 +116,30 @@ async function getSlidePaths(zip) {
     .map((x) => x.name);
 }
 
-// <a:p> 문단 단위로 <a:t> 텍스트를 모아 줄바꿈으로 잇는다
+// 슬라이드 번호·바닥글·날짜 같은 자리표시자는 발표 내용이 아니므로 뺀다
+const SKIP_PLACEHOLDERS = new Set(['sldNum', 'sldImg', 'hdr', 'ftr', 'dt']);
+
+// 이 노드가 들어 있는 도형(<p:sp>)이 건너뛸 자리표시자인지 확인
+function inSkippedPlaceholder(node) {
+  for (let n = node.parentNode; n; n = n.parentNode) {
+    if (n.namespaceURI === NS.p && n.localName === 'sp') {
+      const ph = n.getElementsByTagNameNS(NS.p, 'ph')[0];
+      return Boolean(ph && SKIP_PLACEHOLDERS.has(ph.getAttribute('type')));
+    }
+  }
+  return false;
+}
+
+// <a:p> 문단 단위로 <a:t> 텍스트를 모아 줄바꿈으로 잇는다 (표 안의 글자도 포함)
 function extractParagraphs(root) {
   const lines = [];
   for (const p of root.getElementsByTagNameNS(NS.a, 'p')) {
+    if (inSkippedPlaceholder(p)) continue;
     const line = [...p.getElementsByTagNameNS(NS.a, 't')].map((t) => t.textContent).join('');
     if (line.trim()) lines.push(line.trim());
   }
   return lines.join('\n');
 }
-
-// 발표자 노트: 슬라이드 번호·머리글 같은 자리표시자는 빼고 본문만 가져온다
-const NOTES_SKIP_PLACEHOLDERS = new Set(['sldNum', 'sldImg', 'hdr', 'ftr', 'dt']);
 
 async function extractNotes(zip, slidePath) {
   const dir = slidePath.slice(0, slidePath.lastIndexOf('/'));
@@ -137,33 +149,32 @@ async function extractNotes(zip, slidePath) {
   const notesFile = notesRel && zip.file(notesRel.target);
   if (!notesFile) return '';
 
-  const doc = parseXml(await notesFile.async('string'));
-  const parts = [];
-  for (const sp of doc.getElementsByTagNameNS(NS.p, 'sp')) {
-    const ph = sp.getElementsByTagNameNS(NS.p, 'ph')[0];
-    if (ph && NOTES_SKIP_PLACEHOLDERS.has(ph.getAttribute('type'))) continue;
-    const text = extractParagraphs(sp);
-    if (text) parts.push(text);
-  }
-  return parts.join('\n');
+  return extractParagraphs(parseXml(await notesFile.async('string')));
 }
 
+// 반환값: { slides, hiddenCount } — 숨긴 슬라이드(show="0")는 발표에 나오지 않으므로 뺀다
 async function parsePptx(file) {
   const zip = await JSZip.loadAsync(file);
   const paths = await getSlidePaths(zip);
   if (!paths.length) throw new Error('슬라이드를 찾지 못했습니다. 올바른 .pptx 파일인지 확인해 주세요.');
 
   const slides = [];
-  for (let i = 0; i < paths.length; i++) {
-    const doc = parseXml(await zip.file(paths[i]).async('string'));
+  let hiddenCount = 0;
+  for (const path of paths) {
+    const doc = parseXml(await zip.file(path).async('string'));
+    if (doc.documentElement.getAttribute('show') === '0') {
+      hiddenCount++;
+      continue;
+    }
     slides.push({
-      index: i + 1,
+      index: slides.length + 1,
       text: extractParagraphs(doc),
-      notes: await extractNotes(zip, paths[i]),
+      notes: await extractNotes(zip, path),
       memo: '',
     });
   }
-  return slides;
+  if (!slides.length) throw new Error('보이는 슬라이드가 없습니다. (모든 슬라이드가 숨김 상태)');
+  return { slides, hiddenCount };
 }
 
 // ======================================================================
@@ -180,14 +191,28 @@ async function handleFile(file) {
     setStatus(el.uploadStatus, '.pptx 파일만 올릴 수 있습니다. (.ppt는 PowerPoint에서 .pptx로 다시 저장해 주세요)', true);
     return;
   }
+  // 생성 중에 파일이 바뀌면 결과가 다른 PPT 기준으로 만들어지므로 막는다
+  if (state.busy) {
+    setStatus(el.uploadStatus, '대본을 생성하는 중에는 새 파일을 올릴 수 없습니다. 생성이 끝난 뒤 다시 올려 주세요.', true);
+    return;
+  }
   setStatus(el.uploadStatus, `"${file.name}" 읽는 중...`);
   try {
-    state.slides = await parsePptx(file);
+    const { slides, hiddenCount } = await parsePptx(file);
+    state.slides = slides;
     state.fileName = file.name;
-    const withNotes = state.slides.filter((s) => s.notes).length;
+    // 다른 PPT의 결과와 섞이지 않도록 이전 결과를 비운다
+    state.results = [];
+    el.resultSection.classList.add('hidden');
+    el.resultGrid.replaceChildren();
+    hideError();
+    setStatus(el.generateStatus, '');
+
+    const withNotes = slides.filter((s) => s.notes).length;
     setStatus(el.uploadStatus,
-      `"${file.name}" — 슬라이드 ${state.slides.length}장을 읽었습니다.` +
-      (withNotes ? ` (발표자 노트 ${withNotes}장 포함)` : ''));
+      `"${file.name}" — 슬라이드 ${slides.length}장을 읽었습니다.` +
+      (withNotes ? ` (발표자 노트 ${withNotes}장 포함)` : '') +
+      (hiddenCount ? ` 숨긴 슬라이드 ${hiddenCount}장은 제외했습니다.` : ''));
     renderSlides();
     el.previewSection.classList.remove('hidden');
     el.settingsSection.classList.remove('hidden');
@@ -217,7 +242,11 @@ function renderSlides() {
 }
 
 // 드래그 앤 드롭
-el.fileInput.addEventListener('change', (e) => handleFile(e.target.files[0]));
+el.fileInput.addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  e.target.value = ''; // 같은 파일을 다시 골라도 change 이벤트가 나도록 비운다
+  handleFile(file);
+});
 ['dragenter', 'dragover'].forEach((type) => el.dropzone.addEventListener(type, (e) => {
   e.preventDefault();
   el.dropzone.classList.add('dragover');
@@ -241,6 +270,15 @@ const DEFAULT_MODELS = {
 const CLAUDE_FALLBACK_MODELS = new Set([
   'claude-opus-5-5', 'claude-opus-5', 'claude-fable-5-2', 'claude-fable-5-1', 'claude-sonnet-5-5',
 ]);
+
+// fetch 자체가 실패한 경우(인터넷 끊김, CORS 차단 등)만 네트워크 오류로 바꿔 준다
+async function fetchOrNetworkError(url, options) {
+  try {
+    return await fetch(url, options);
+  } catch (e) {
+    throw new Error(`네트워크 오류: API 서버에 연결하지 못했습니다. 인터넷 연결을 확인해 주세요. (${e.message})`);
+  }
+}
 
 async function readErrorMessage(res) {
   try {
@@ -281,7 +319,7 @@ async function callClaude({ model, apiKey, system, user }) {
     body.fallbacks = 'default';
   }
 
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
+  const res = await fetchOrNetworkError('https://api.anthropic.com/v1/messages', {
     method: 'POST', headers, body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(httpErrorText(res.status, await readErrorMessage(res)));
@@ -297,7 +335,7 @@ async function callClaude({ model, apiKey, system, user }) {
 
 // OpenAI Chat Completions API 호출
 async function callOpenAI({ model, apiKey, system, user }) {
-  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+  const res = await fetchOrNetworkError('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -317,6 +355,9 @@ async function callOpenAI({ model, apiKey, system, user }) {
 
   const data = await res.json();
   const choice = data.choices?.[0];
+  if (choice?.message?.refusal) {
+    throw new Error(`AI가 이 요청에 대한 응답을 거절했습니다: ${choice.message.refusal}`);
+  }
   return { text: choice?.message?.content || '', truncated: choice?.finish_reason === 'length' };
 }
 
@@ -365,7 +406,7 @@ function formatTime(totalSeconds) {
 }
 
 // AI 응답을 슬라이드 순서에 맞춰 정리하고 시간을 계산해 결과 객체를 만든다
-function buildResult(parsed, settings, slideCount) {
+function buildResult(parsed, settings, slideCount, fileName) {
   const byIndex = new Map(parsed.slides.map((s) => [s.index, s]));
   const slides = [];
   for (let i = 1; i <= slideCount; i++) {
@@ -377,6 +418,7 @@ function buildResult(parsed, settings, slideCount) {
   return {
     id: state.results.length + 1,
     createdAt: new Date(),
+    fileName,
     settings,
     slides,
     questions: parsed.questions,
@@ -425,7 +467,7 @@ async function generate() {
   // 입력 확인
   const problems = [];
   if (!state.slides.length) problems.push('먼저 PPT 파일을 올려 주세요.');
-  if (!(settings.minutes > 0)) problems.push('발표 시간을 1분 이상으로 입력해 주세요.');
+  if (!(settings.minutes >= 1 && settings.minutes <= 120)) problems.push('발표 시간은 1~120분 사이로 입력해 주세요.');
   if (!settings.model) problems.push('모델 이름을 입력해 주세요.');
   if (!apiKey) problems.push('API 키를 입력해 주세요.');
   if (problems.length) {
@@ -437,13 +479,17 @@ async function generate() {
   setBusy(true);
   setStatus(el.generateStatus, `${settings.model}에게 대본을 요청하는 중... (슬라이드 수에 따라 1~2분 걸릴 수 있어요)`);
 
+  // 요청을 보낸 시점의 슬라이드와 파일 이름을 고정해 둔다 (응답 기다리는 동안 바뀌어도 안전하게)
+  const slides = state.slides;
+  const fileName = state.fileName;
+
   let raw = '';
   try {
     const reply = await callAI(settings.provider, {
       model: settings.model,
       apiKey,
       system: buildSystemPrompt(),
-      user: buildUserPrompt({ slides: state.slides, ...settings }),
+      user: buildUserPrompt({ slides, ...settings }),
     });
     raw = reply.text;
 
@@ -459,18 +505,15 @@ async function generate() {
       return;
     }
 
-    const result = buildResult(parsed, settings, state.slides.length);
+    const result = buildResult(parsed, settings, slides.length, fileName);
     state.results.push(result);
     renderResults();
     setStatus(el.generateStatus, `완료! 결과 #${result.id}가 아래에 추가되었습니다.`);
     el.resultSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch (e) {
     console.error(e);
-    // fetch 자체가 실패하면(네트워크/CORS) TypeError가 난다
-    const message = e instanceof TypeError
-      ? `네트워크 오류: API 서버에 연결하지 못했습니다. 인터넷 연결을 확인해 주세요. (${e.message})`
-      : e.message;
-    showError(message, raw);
+    // 네트워크 오류 문구는 fetchOrNetworkError에서 붙여 준다
+    showError(e.message, raw);
     setStatus(el.generateStatus, '');
   } finally {
     setBusy(false);
@@ -576,7 +619,7 @@ el.compareSelect.addEventListener('change', renderCompare);
 function resultToText(result) {
   const s = result.settings;
   const lines = [
-    `[대본.pptx] ${state.fileName || '발표'} — 발표 대본`,
+    `[대본.pptx] ${result.fileName || '발표'} — 발표 대본`,
     `목표 시간: ${formatTime(result.targetSeconds)} / AI 예상: ${formatTime(result.aiTotal)} / 글자 수 기준: ${formatTime(result.calcTotal)}`,
     `말투: ${s.tone} · 모델: ${s.model}${s.professorStyle.trim() ? ` · 교수님 스타일: ${s.professorStyle.trim()}` : ''}`,
     '',
@@ -606,11 +649,20 @@ async function copyResult(result, button) {
     ta.value = text;
     document.body.append(ta);
     ta.select();
-    document.execCommand('copy');
+    const ok = document.execCommand('copy');
     ta.remove();
+    if (!ok) {
+      flashButton(button, '복사 실패 — .txt 다운로드를 이용해 주세요');
+      return;
+    }
   }
-  const original = button.textContent;
-  button.textContent = '복사됨!';
+  flashButton(button, '복사됨!');
+}
+
+function flashButton(button, message) {
+  const original = button.dataset.label || button.textContent;
+  button.dataset.label = original;
+  button.textContent = message;
   setTimeout(() => { button.textContent = original; }, 1500);
 }
 
@@ -618,12 +670,14 @@ function downloadResult(result) {
   const pad = (n) => String(n).padStart(2, '0');
   const d = result.createdAt;
   const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
-  const base = (state.fileName || '발표').replace(/\.pptx$/i, '');
+  const base = (result.fileName || '발표').replace(/\.pptx$/i, '');
+  // 맨 앞의 BOM(﻿)은 메모장에서 한글이 깨지지 않게 해 준다
   const blob = new Blob(['﻿' + resultToText(result)], { type: 'text/plain;charset=utf-8' });
   const url = URL.createObjectURL(blob);
   const a = h('a', { href: url, download: `${base}_대본_${stamp}_#${result.id}.txt` });
   document.body.append(a);
   a.click();
   a.remove();
-  URL.revokeObjectURL(url);
+  // 바로 해제하면 일부 브라우저(Firefox, Safari)에서 다운로드가 실패하므로 잠시 뒤에 해제
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
