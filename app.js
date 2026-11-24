@@ -36,6 +36,8 @@ const el = {
   retryBtn: $('retry-btn'),
   resultSection: $('result-section'),
   resultGrid: $('result-grid'),
+  compareWrap: $('compare-wrap'),
+  compareSelect: $('compare-select'),
 };
 
 // 작은 DOM 생성 도우미 (텍스트는 항상 textContent로 넣어 HTML 주입을 막는다)
@@ -531,7 +533,9 @@ function renderResultColumn(result, { previous = false } = {}) {
           h('span', { class: 'chip' }, s.tone),
           h('span', { class: 'chip' }, s.model),
           s.professorStyle.trim() ? h('span', { class: 'chip' }, `교수님: ${s.professorStyle.trim()}`) : null)),
-      h('div', { class: 'result-actions' })),
+      h('div', { class: 'result-actions' },
+        h('button', { type: 'button', onclick: (e) => copyResult(result, e.currentTarget) }, '전체 복사'),
+        h('button', { type: 'button', onclick: () => downloadResult(result) }, '.txt 다운로드'))),
     timeSummary(result),
     h('h4', {}, '발표 대본'),
     scripts,
@@ -539,9 +543,87 @@ function renderResultColumn(result, { previous = false } = {}) {
     questions);
 }
 
+// 비교 선택: 새 결과가 생기면 바로 직전 결과를 기본 비교 대상으로 고른다
 function renderResults() {
   const latest = state.results[state.results.length - 1];
   if (!latest) return;
   el.resultSection.classList.remove('hidden');
-  el.resultGrid.replaceChildren(renderResultColumn(latest));
+
+  const previousOnes = state.results.slice(0, -1);
+  el.compareWrap.classList.toggle('hidden', previousOnes.length === 0);
+  el.compareSelect.replaceChildren(
+    h('option', { value: '' }, '비교 안 함'),
+    ...previousOnes.slice().reverse().map((r) => h('option', { value: r.id },
+      `결과 #${r.id} (${r.settings.minutes}분 · ${r.settings.tone} · ${r.settings.model})`)));
+  el.compareSelect.value = previousOnes.length ? String(previousOnes[previousOnes.length - 1].id) : '';
+  renderCompare();
+}
+
+function renderCompare() {
+  const latest = state.results[state.results.length - 1];
+  const other = state.results.find((r) => String(r.id) === el.compareSelect.value);
+  el.resultGrid.classList.toggle('compare', Boolean(other));
+  const columns = [renderResultColumn(latest)];
+  if (other) columns.push(renderResultColumn(other, { previous: true }));
+  el.resultGrid.replaceChildren(...columns);
+}
+
+el.compareSelect.addEventListener('change', renderCompare);
+
+// ======================================================================
+// 7. 복사 / 다운로드
+// ======================================================================
+function resultToText(result) {
+  const s = result.settings;
+  const lines = [
+    `[대본.pptx] ${state.fileName || '발표'} — 발표 대본`,
+    `목표 시간: ${formatTime(result.targetSeconds)} / AI 예상: ${formatTime(result.aiTotal)} / 글자 수 기준: ${formatTime(result.calcTotal)}`,
+    `말투: ${s.tone} · 모델: ${s.model}${s.professorStyle.trim() ? ` · 교수님 스타일: ${s.professorStyle.trim()}` : ''}`,
+    '',
+  ];
+  for (const sl of result.slides) {
+    lines.push(`■ 슬라이드 ${sl.index} (약 ${sl.missing ? '-' : formatTime(sl.calcSeconds)})`);
+    lines.push(sl.missing ? '(대본 없음)' : sl.script);
+    lines.push('');
+  }
+  if (result.questions.length) {
+    lines.push('■ 예상 질문');
+    result.questions.forEach((q, i) => {
+      lines.push(`${i + 1}. ${q.question}`);
+      if (q.answerHint) lines.push(`   → 답변 방향: ${q.answerHint}`);
+    });
+  }
+  return lines.join('\n');
+}
+
+async function copyResult(result, button) {
+  const text = resultToText(result);
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // file:// 등 clipboard API를 못 쓰는 환경을 위한 대체 방법
+    const ta = h('textarea', {});
+    ta.value = text;
+    document.body.append(ta);
+    ta.select();
+    document.execCommand('copy');
+    ta.remove();
+  }
+  const original = button.textContent;
+  button.textContent = '복사됨!';
+  setTimeout(() => { button.textContent = original; }, 1500);
+}
+
+function downloadResult(result) {
+  const pad = (n) => String(n).padStart(2, '0');
+  const d = result.createdAt;
+  const stamp = `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
+  const base = (state.fileName || '발표').replace(/\.pptx$/i, '');
+  const blob = new Blob(['﻿' + resultToText(result)], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = h('a', { href: url, download: `${base}_대본_${stamp}_#${result.id}.txt` });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
